@@ -7,9 +7,15 @@ import time
 from cex_connectors import BingXConnector
 import telegram_bot
 import asyncio
+import os
+try:
+    from statistics import log_trade, update_trade_exit
+except ImportError:
+    from .statistics import log_trade, update_trade_exit
 
 # URL для WebSocket с listenKey
 LISTEN_KEY_URL = "wss://open-api-swap.bingx.com/swap-market?listenKey={}"
+ORDER_CACHE_FILE = 'order_cache.json'
 
 # Класс для работы с WebSocket
 class BingXWebSocket:
@@ -21,6 +27,7 @@ class BingXWebSocket:
         self.ws = None
         self.connector = BingXConnector()
         self.should_reconnect = True  # Флаг для управления переподключением
+        self.open_trades = {}  # Кэш открытых сделок: order_id -> dict
 
     def generate_listen_key(self):
         """Генерация listenKey через REST API."""
@@ -103,24 +110,110 @@ class BingXWebSocket:
             print(f"Processing order update: {order_data}")
     
             order_status = order_data.get("X")
-            order_id = order_data.get("i")
+            order_id = str(order_data.get("i"))
             symbol = order_data.get("s")
-            side = order_data.get("S")  # Направление (BUY/SELL)
-            price = order_data.get("p")
+            side = order_data.get("S")  # BUY/SELL
+            price = float(order_data.get("p", 0) or 0)
             order_type = order_data.get("o")
+            quantity = float(order_data.get("q", 0) or 0)
+            close_time = order_data.get("T")  # время закрытия (timestamp)
 
-            if order_status == "CANCELED":
-                print(f"Order {order_id} canceled")
-                await telegram_bot.send_message(  # Используем await для асинхронного вызова
-                    f"⚠️ {side} ORDER canceled: Coin: {symbol}, Price: {price}",
-                    self.chat_id
-                )
-            elif order_status == "TRADE" or order_status == "FILLED":  # Добавлен статус FILLED
-                print(f"Order {order_id} executed")
-                await telegram_bot.send_message(  # Используем await для асинхронного вызова
+            # --- Закрытие позиции: отменяем трейлинг-ордера ---
+            if order_status in ("TRADE", "FILLED", "CLOSED", "PARTIALLY_FILLED"):
+                print(f"Order {order_id} executed/closed")
+                await telegram_bot.send_message(
                     f"☑️ {side} {order_type} ORDER executed: Coin: {symbol}, Price: {price}",
                     self.chat_id
                 )
+                
+                # Отменяем трейлинг-ордера ТОЛЬКО при закрытии позиции
+                if order_type in ("STOP", "STOP_MARKET", "TAKE_PROFIT", "TAKE_PROFIT_MARKET", "TRAILING_STOP_MARKET"):
+                    try:
+                        from bot_gc import cancel_all_trailing_orders
+                        
+                        # Используем positionSide из WebSocket события (ps)
+                        position_side = order_data.get("ps", "LONG")  # по умолчанию LONG
+                        
+                        print(f"[CLOSE] Закрытие позиции {symbol} ({position_side}) через {order_type}")
+                        
+                        # Отменяем трейлинг-ордера для этой позиции
+                        cancel_all_trailing_orders(self.connector, symbol, position_side)
+                        print(f"[CANCELED] Трейлинг-ордера отменены для {symbol} ({position_side})")
+                        
+                    except Exception as e:
+                        print(f"[ERROR] Ошибка отмены трейлинг-ордеров: {e}")
+                        await telegram_bot.send_message(
+                            f"❌ Ошибка отмены трейлинг-ордеров для {symbol}: {e}",
+                            self.chat_id
+                        )
+                
+                # Логирование сделки (если есть данные в кэше)
+                cache = {}
+                if os.path.exists(ORDER_CACHE_FILE):
+                    with open(ORDER_CACHE_FILE, 'r', encoding='utf-8') as f:
+                        try:
+                            cache = json.load(f)
+                        except Exception:
+                            cache = {}
+                trade_data = cache.pop(order_id, None)
+                if trade_data:
+                    # Определяем причину закрытия
+                    if order_type in ("TAKE_PROFIT", "TAKE_PROFIT_MARKET"):
+                        reason = "TP"
+                    elif order_type in ("STOP", "STOP_MARKET"):
+                        reason = "SL"
+                    elif order_type == "TRAILING_STOP_MARKET":
+                        reason = "TRAILING"
+                    elif order_type == "LIMIT":
+                        reason = "LIMIT"
+                    else:
+                        reason = "MANUAL"
+                    exit_data = {
+                        'exit_time': close_time,
+                        'exit_price': price,
+                        'reason': reason,
+                        'pnl': '',  # можно рассчитать, если есть данные
+                        'fee': '',
+                    }
+                    print("UPDATE_TRADE_EXIT", trade_data['symbol'], trade_data['direction'], trade_data['entry_time'], exit_data)
+                    update_trade_exit(
+                        symbol=trade_data['symbol'],
+                        direction=trade_data['direction'],
+                        entry_time=trade_data['entry_time'],
+                        exit_data=exit_data
+                    )
+                    print(f"[UPDATED] Сделка {order_id} обновлена в статистике.")
+                    
+                    # Сохраняем обновлённый кэш
+                    with open(ORDER_CACHE_FILE, 'w', encoding='utf-8') as f:
+                        json.dump(cache, f, ensure_ascii=False, indent=2)
+                else:
+                    print(f"[WARN] Нет данных по открытию сделки {order_id} для логирования!")
+                return
+
+            # --- Открытие позиции: ничего не делаем ---
+            if order_status in ("NEW", "OPEN", "LIMIT"):
+                print(f"Order {order_id} opened: {order_type}")
+                return
+
+            # --- Отмена ордера: отменяем трейлинг-ордера ---
+            if order_status == "CANCELED":
+                print(f"Order {order_id} canceled")
+                await telegram_bot.send_message(
+                    f"⚠️ {side} ORDER canceled: Coin: {symbol}, Price: {price}",
+                    self.chat_id
+                )
+                
+                # Отменяем трейлинг-ордера при отмене основного ордера
+                try:
+                    from bot_gc import cancel_all_trailing_orders
+                    # Используем positionSide из WebSocket события (ps)
+                    position_side = order_data.get("ps", "LONG")  # по умолчанию LONG
+                    cancel_all_trailing_orders(self.connector, symbol, position_side)
+                    print(f"[CANCELED] Трейлинг-ордера отменены при отмене ордера {order_id} ({position_side})")
+                except Exception as e:
+                    print(f"[ERROR] Ошибка отмены трейлинг-ордеров при отмене ордера: {e}")
+                return
             else:
                 print(f"Unknown order status: {order_status}")
 
